@@ -25,8 +25,8 @@ jobs:
     - name: Install dependencies
       run: |
         apt-get update
-        apt-get install -y cmake ninja-build git
-        pip3 install pytest pytest-cov
+        apt-get install -y cmake ninja-build git python3-pip
+        python3 -m pip install --break-system-packages pytest pytest-cov
     
     - name: Configure CMake
       run: |
