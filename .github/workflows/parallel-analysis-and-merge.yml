@@ -4,19 +4,32 @@ on:
   workflow_dispatch:
     inputs:
       data_file:
-        description: "Repo path to newline-separated ROOT URLs"
+        description: "Path to the Data URLs input file"
         default: "exercises/TT-E2-docs-and-ci/ci-parallel-root/data.csv"
         required: true
-      max_events:
-        description: "Optional max events per file (0 = all)"
-        default: "0"
-        required: false
+
+  schedule:
+    - cron: "0 */10 * * *" # every 10 hours (UTC)
+
+  push:
+    branches: [main]
+    paths:
+      - "exercises/TT-E2-docs-and-ci/ci-parallel-root/data.csv"
+      - "exercises/TT-E2-docs-and-ci/ci-parallel-root/mc.csv"
+      - "exercises/TT-E2-docs-and-ci/ci-parallel-root/gamma-gamma-analysis-v1.py"
+      - "exercises/TT-E2-docs-and-ci/ci-parallel-root/root-to-png.py"
 
 permissions:
   contents: write
 
+concurrency:
+  group: atlas-root-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
-  WORKDIR: exercises/TT-E2-docs-and-ci/ci-parallel-root
+  EX_DIR: exercises/TT-E2-docs-and-ci/ci-parallel-root
+  DEFAULT_DATA_FILE: exercises/TT-E2-docs-and-ci/ci-parallel-root/data.csv
+  ROOT_IMAGE: rootproject/root:latest
 
 jobs:
   setup:
@@ -24,154 +37,162 @@ jobs:
     outputs:
       files: ${{ steps.read_file.outputs.files }}
       data_file_name: ${{ steps.extract_name.outputs.data_file_name }}
-      max_events: ${{ steps.max_events.outputs.max_events }}
+      data_file_path: ${{ steps.pick_file.outputs.data_file_path }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Capture max_events input
-        id: max_events
+      # Pick input file for workflow_dispatch, otherwise use default for schedule/push
+      - name: Pick data file path
+        id: pick_file
+        shell: bash
         run: |
-          echo "max_events=${{ github.event.inputs.max_events }}" >> "$GITHUB_OUTPUT"
+          DATA_FILE="${{ github.event.inputs.data_file }}"
+          if [ -z "$DATA_FILE" ]; then
+            DATA_FILE="${{ env.DEFAULT_DATA_FILE }}"
+          fi
+          echo "data_file_path=$DATA_FILE" >> "$GITHUB_OUTPUT"
 
-      - name: Read CSV File and Prepare Jobs
+      - name: Read CSV file and prepare matrix
         id: read_file
+        shell: bash
         run: |
-          # Read lines, drop empty lines + comments, output JSON array
-          python3 - <<'PY' >> "$GITHUB_OUTPUT"
-          import json, pathlib, os
-          ws = pathlib.Path(os.environ["GITHUB_WORKSPACE"])
-          p = ws / "${{ github.event.inputs.data_file }}"
-          lines = []
-          for raw in p.read_text().splitlines():
-            s = raw.strip()
-            if not s or s.startswith("#"):
-              continue
-            lines.append(s)
-          print("files=" + json.dumps(lines))
-          PY
+          DATA_FILE="${{ steps.pick_file.outputs.data_file_path }}"
+          echo "Using data file: $DATA_FILE"
 
-      - name: Extract Data File Name
+          # Build JSON array from lines, drop empty lines.
+          files=$(jq -R -s -c 'split("\n") | map(select(length>0))' < "$DATA_FILE")
+
+          # Safety: ensure it's an array
+          echo "$files" | jq -e 'type=="array"' >/dev/null
+
+          echo "files=$files" >> "$GITHUB_OUTPUT"
+
+      - name: Extract data file name (without .csv)
         id: extract_name
+        shell: bash
         run: |
-          data_file_name=$(basename "${{ github.event.inputs.data_file }}" .csv)
+          DATA_FILE="${{ steps.pick_file.outputs.data_file_path }}"
+          data_file_name=$(basename "$DATA_FILE" .csv)
           echo "data_file_name=$data_file_name" >> "$GITHUB_OUTPUT"
 
   process-file:
     needs: setup
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     strategy:
       fail-fast: false
       matrix:
         file: ${{ fromJSON(needs.setup.outputs.files) }}
-    outputs:
-      data_file_name: ${{ needs.setup.outputs.data_file_name }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Run ROOT Script in Docker
+      # Each matrix job generates plots into EX_DIR/plots
+      - name: Run gamma-gamma analysis in ROOT Docker
         uses: addnab/docker-run-action@v3
         with:
-          image: rootproject/root:latest
-          options: --rm -v ${{ github.workspace }}:/workspace -w /workspace/${{ env.WORKDIR }}
+          image: ${{ env.ROOT_IMAGE }}
+          options: --rm -v ${{ github.workspace }}:/workspace
           run: |
-            python3 gamma-gamma-analysis-v1.py "${{ matrix.file }}" "${{ needs.setup.outputs.max_events }}"
+            set -e
+            cd /workspace/${{ env.EX_DIR }}
+            mkdir -p plots
+            python3 gamma-gamma-analysis-v1.py "${{ matrix.file }}"
 
-      - name: Commit and Push Histogram Plot
+      # Do NOT commit here. Upload artifacts. One final job will commit once.
+      - name: Upload per-file histogram outputs
         if: always()
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
+        uses: actions/upload-artifact@v4
+        with:
+          name: hist-${{ strategy.job-index }}
+          path: |
+            ${{ env.EX_DIR }}/plots/histogram_*.png
+            ${{ env.EX_DIR }}/plots/histogram_*.root
+          if-no-files-found: ignore
+          retention-days: 7
 
-          cd "${{ env.WORKDIR }}"
-
-          if ls plots/histogram_*.png plots/histogram_*.root 1> /dev/null 2>&1; then
-            git add plots/histogram_*.png plots/histogram_*.root
-            git diff --cached --exit-code || git commit -m "Add updated histogram plot" --allow-empty
-          else
-            echo "No plot generated"
-          fi
-
-          # Rebase then push to the SAME branch the workflow runs on
-          git fetch origin "${GITHUB_REF_NAME}"
-          git stash push -m "Stash uncommitted changes for rebase" || true
-          git rebase "origin/${GITHUB_REF_NAME}" || (git rebase --abort; git pull --rebase origin "${GITHUB_REF_NAME}")
-          git stash pop || true
-          git push --force-with-lease origin "HEAD:${GITHUB_REF_NAME}"
-
-  merge-root-files:
+  merge-and-publish:
     needs: [setup, process-file]
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Verify .root Files
+      # Collect all histogram_*.root/png from matrix jobs into EX_DIR/plots
+      - name: Download histogram artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: hist-*
+          merge-multiple: true
+          path: ${{ env.EX_DIR }}/plots
+
+      - name: List collected plots
+        shell: bash
         run: |
-          echo "Listing all .root files in plots directory:"
-          ls -lh "${{ env.WORKDIR }}/plots/"*.root || echo "No .root files found"
+          echo "Collected files:"
+          ls -lh "${{ env.EX_DIR }}/plots" || true
 
       - name: Merge ROOT files with hadd (Docker)
         uses: addnab/docker-run-action@v3
         with:
-          image: rootproject/root:latest
-          options: --rm -v ${{ github.workspace }}:/workspace -w /workspace/${{ env.WORKDIR }}/plots
+          image: ${{ env.ROOT_IMAGE }}
+          options: --rm -v ${{ github.workspace }}:/workspace
           run: |
-            hadd -f "merged_histograms_${{ needs.setup.outputs.data_file_name }}.root" histogram_*.root
+            set -e
+            cd /workspace/${{ env.EX_DIR }}/plots
 
-      - name: Commit and Push Merged ROOT File
-        if: always()
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
+            shopt -s nullglob
+            roots=(histogram_*.root)
+            if [ ${#roots[@]} -eq 0 ]; then
+              echo "No histogram_*.root files found. Nothing to merge."
+              exit 0
+            fi
 
-          git add "${{ env.WORKDIR }}/plots/merged_histograms_${{ needs.setup.outputs.data_file_name }}.root" || true
-          git diff --cached --exit-code || git commit -m "Add merged ROOT file" --allow-empty
+            out="merged_histograms_${{ needs.setup.outputs.data_file_name }}.root"
+            hadd -f "$out" histogram_*.root
+            echo "Created: $out"
 
-          git fetch origin "${GITHUB_REF_NAME}"
-          git pull --rebase origin "${GITHUB_REF_NAME}"
-          git push --force-with-lease origin "HEAD:${GITHUB_REF_NAME}"
-
-  generate-png:
-    needs: [setup, merge-root-files]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Run root-to-png.py in Docker
+      - name: Convert merged ROOT -> PNG (Docker)
         uses: addnab/docker-run-action@v3
         with:
-          image: rootproject/root:latest
-          options: --rm -v ${{ github.workspace }}:/workspace -w /workspace/${{ env.WORKDIR }}
+          image: ${{ env.ROOT_IMAGE }}
+          options: --rm -v ${{ github.workspace }}:/workspace
           run: |
-            python3 root-to-png.py "plots/merged_histograms_${{ needs.setup.outputs.data_file_name }}.root"
+            set -e
+            cd /workspace/${{ env.EX_DIR }}
 
-      - name: Commit and Push Merged PNG File
-        if: always()
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            merged="plots/merged_histograms_${{ needs.setup.outputs.data_file_name }}.root"
+            if [ ! -f "$merged" ]; then
+              echo "Merged ROOT file not found ($merged). Skipping PNG."
+              exit 0
+            fi
+
+            python3 root-to-png.py "$merged"
+
+      - name: Commit and push plots to repo
+        shell: bash
         run: |
+          set -e
+          BRANCH="${{ github.ref_name }}"
+
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
 
-          git add "${{ env.WORKDIR }}/plots/merged_histograms_${{ needs.setup.outputs.data_file_name }}.png" || true
-          git diff --cached --exit-code || git commit -m "Add merged histogram as PNG" --allow-empty
+          # Add everything produced in plots
+          git add "${{ env.EX_DIR }}/plots" || true
 
-          git fetch origin "${GITHUB_REF_NAME}"
-          git pull --rebase origin "${GITHUB_REF_NAME}"
-          git push --force-with-lease origin "HEAD:${GITHUB_REF_NAME}"
+          # If nothing changed, stop cleanly
+          if git diff --cached --quiet; then
+            echo "No plot changes to commit."
+            exit 0
+          fi
+
+          git commit -m "CI: update plots (${BRANCH}) [run ${{ github.run_id }}]"
+
+          # Rebase to reduce push failures
+          git fetch origin "$BRANCH"
+          git pull --rebase origin "$BRANCH"
+
+          git push origin "HEAD:${BRANCH}"
